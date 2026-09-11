@@ -35,6 +35,7 @@ inline constexpr const char *kNvofResolutionItems[] = {
     "Cap at 1080p", "Cap at 720p", "Cap at 360p", "Cap at 180p" };
 inline constexpr const char *kPresetItems[] = {
     "Default (NVIDIA)", "Preset J", "Preset K", "Preset L (Recommended default)", "Preset M" };
+inline constexpr const char *kMfgItems[] = { "2x (1 generated)", "3x (2 generated)", "4x (3 generated)" };
 inline constexpr const char *kSourceItems[] = {
     "Disabled (use game backbuffer)", "16:9 - 960 x 540", "16:9 - 1280 x 720",
     "16:9 - 1600 x 900", "16:9 - 1920 x 1080", "16:9 - 2560 x 1440",
@@ -90,6 +91,8 @@ inline constexpr NRSetting kSettings[] = {
       "Off by default; enable only as a per-frame SR-history diagnostic.", Group::Neural },
     { "FrameGeneration", "Experimental DLSS Frame Generation (2x)", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0,
       "Presents one generated frame followed by one reconstructed real frame.", Group::Neural },
+    { "MfgMultiplier", "MFG multiplier (RTX 40 experimental)", NR_COMBO, 0, 0, 2, nullptr, kMfgItems, 3,
+      "2x is the normal single-frame path. 3x/4x require the Ada runtime unlock and restart after changing.", Group::Neural },
     { "AsyncComputePipeline", "Asynchronous NGX compute (experimental)", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0,
       "Runs NGX work on a compute queue so it can overlap game graphics. Restart after changing it.", Group::Neural },
 

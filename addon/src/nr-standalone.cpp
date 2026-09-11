@@ -35,12 +35,13 @@
 #include "performance-telemetry.h"
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
+#include "../../mfg/aio-mfg-unlock.hpp"
 
-#define ADDON_VERSION "2.2.3"
+#define ADDON_VERSION "2.2.3-mfg1"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Standalone D3D9/D3D11/D3D12/Vulkan DLSS Neural Rendering, Super Resolution, and Frame Generation.";
+    "Standalone D3D9/D3D11/D3D12/Vulkan DLSS Neural Rendering, Super Resolution, Frame Generation, and experimental Ada MFG.";
 
 static HMODULE g_self;
 // Set by the 64-bit carrier used for 32-bit games. The ReShade runtime lives
@@ -604,6 +605,10 @@ static unsigned int g_nr_pass_count = 1;
 static bool g_nr_second_pass_failed = false;
 static bool g_nr_third_pass_failed = false;
 static bool g_framegen_enabled = true;
+static unsigned int g_mfg_multiplier = 2;
+static unsigned int g_mfg_active_generated_count = 1;
+static unsigned int g_mfg_active_frame_index = 1;
+static bool g_mfg_unlock_logged = false;
 static bool g_framegen_failed = false;
 static std::atomic<bool> g_feature_recreate_requested{false};
 static bool g_need_history_reset = true;
@@ -783,6 +788,8 @@ struct PresentationFrameSlot
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> fg_list;
     Microsoft::WRL::ComPtr<ID3D12Resource> real_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> generated_output;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> mfg_generated_outputs;
+    unsigned int mfg_generated_count = 1;
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> fg_telemetry_query_heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> fg_telemetry_readback;
@@ -1034,6 +1041,23 @@ static unsigned int CounterDeltaMicroseconds(const LARGE_INTEGER &begin, const L
 static bool EffectiveFramegenEnabled()
 {
     return g_framegen_enabled;
+}
+
+static unsigned int EffectiveMfgGeneratedCount(bool direct_output)
+{
+    const unsigned int requested = std::clamp(g_mfg_multiplier, 2u, 4u) - 1u;
+    if (requested <= 1u) return 1u;
+    if (!direct_output) return 1u;
+    if (!dlss5_aio_mfg::IsReady())
+    {
+        if (!g_mfg_unlock_logged)
+        {
+            Log("MFG 3x/4x requested but Ada runtime unlock is unavailable; falling back to 2x");
+            g_mfg_unlock_logged = true;
+        }
+        return 1u;
+    }
+    return requested;
 }
 
 static bool EnsureSharedPerformanceTelemetry()
@@ -3001,6 +3025,15 @@ static bool InitializeNgx()
     if (NVSDK_NGX_FAILED(result)) { Fail("DLSS SR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
 
     g_dlssg_module = have_dlssg ? LoadLibraryExW(dlssg_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) : nullptr;
+    if (g_dlssg_module != nullptr && g_mfg_multiplier > 2)
+    {
+        size_t gate_sites = 0, temporal_sites = 0;
+        std::string mfg_detail;
+        if (dlss5_aio_mfg::Apply(g_dlssg_module, gate_sites, temporal_sites, mfg_detail))
+            Log("%s", mfg_detail.c_str());
+        else
+            Log("Ada MFG unlock unavailable: %s; 3x/4x will fall back to 2x", mfg_detail.c_str());
+    }
     auto dlssg_init = g_dlssg_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
     g_fg_create = g_dlssg_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
     g_fg_evaluate = g_dlssg_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
@@ -4027,6 +4060,8 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
         slot.generated_output.Reset();
+        for (auto &output : slot.mfg_generated_outputs) output.Reset();
+        slot.mfg_generated_count = 1;
         slot.real_output.Reset();
         slot.original_input.Reset();
         slot.state.store(PresentationSlotFree, std::memory_order_release);
@@ -5296,6 +5331,11 @@ static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, D
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
             !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input))
             return false;
+        slot.mfg_generated_count = std::clamp(g_mfg_multiplier, 2u, 4u) - 1u;
+        for (unsigned int generated = 1; generated < slot.mfg_generated_count; ++generated)
+            if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON,
+                slot.mfg_generated_outputs[generated - 1]))
+                return false;
         if (g_async_fg_queue && (!slot.fg_telemetry_query_heap || !slot.fg_telemetry_readback) &&
             !CreateTimestampResources(g_neural_device.Get(), 2,
                 slot.fg_telemetry_query_heap, slot.fg_telemetry_readback))
@@ -5440,7 +5480,8 @@ static void SetFgEvaluationContract(ID3D12Resource *real_output, ID3D12Resource 
     g_ngx_params->Set("DLSSG.Depth", depth);
     g_ngx_params->Set("DLSSG.HUDLess", real_output);
     g_ngx_params->Set("DLSSG.OutputInterpolated", generated_output);
-    g_ngx_params->Set("DLSSG.MultiFrameCount", 1u); g_ngx_params->Set("DLSSG.MultiFrameIndex", 1u);
+    g_ngx_params->Set("DLSSG.MultiFrameCount", g_mfg_active_generated_count);
+    g_ngx_params->Set("DLSSG.MultiFrameIndex", g_mfg_active_frame_index);
     for (const char *name : {"DLSSG.CameraViewToClip", "DLSSG.ClipToCameraView",
         "DLSSG.ClipToLensClip", "DLSSG.ClipToPrevClip", "DLSSG.PrevClipToClip"})
         g_ngx_params->Set(name, reinterpret_cast<void *>(identity));
@@ -6320,6 +6361,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     ID3D12Resource *real_output = pipeline_slot.real_output.Get();
     ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
     ID3D12Resource *original_snapshot = pipeline_slot.original_input.Get();
+    ID3D12Resource *fg_outputs[3] = {generated_output, nullptr, nullptr};
+    unsigned int fg_generated_count = 1;
     ScopedPresentationReservation direct_reservation;
     const bool ringed_d3d11_input = legacy_input && !mailbox_d3d11_input &&
         g_present_api == reshade::api::device_api::d3d11;
@@ -6479,6 +6522,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         real_output = presentation.real_output.Get();
         generated_output = presentation.generated_output.Get();
         original_snapshot = presentation.original_input.Get();
+        fg_generated_count = EffectiveMfgGeneratedCount(true);
+        presentation.mfg_generated_count = fg_generated_count;
+        fg_outputs[0] = presentation.generated_output.Get();
+        for (unsigned int generated = 1; generated < fg_generated_count; ++generated)
+            fg_outputs[generated] = presentation.mfg_generated_outputs[generated - 1].Get();
         if (!real_output || !generated_output || !original_snapshot)
         {
             pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
@@ -6796,7 +6844,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         !nvof_visualization_active;
     const bool split_fg_path = evaluate_fg &&
         PhaseScheduledFrameGenerationEnabled() &&
-        direct_reservation.index >= 0;
+        direct_reservation.index >= 0 &&
+        EffectiveMfgGeneratedCount(true) == 1;
     bool split_fg = split_fg_path && AsyncFgGpuIdle();
     if (split_fg_path && !split_fg)
     {
@@ -6808,25 +6857,49 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         ++g_async_fg_busy_bypasses;
     }
     pipeline_slot.fg_split_submission = split_fg;
+    unsigned int evaluated_fg_frames = 0;
     if (evaluate_fg && !split_fg)
     {
-        D3D12_RESOURCE_BARRIER fg_begin[2] = {
-            Transition(real_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            Transition(generated_output, D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-        };
-        commands->ResourceBarrier(2, fg_begin);
-        SetFgEvaluationContract(real_output, generated_output, depth, motion,
-            reset || g_fg_frames.load() == 0);
-        exception = 0;
-        fg_result = SafeEvaluateFg(&exception);
-        if (exception)
+        const unsigned int requested_generated_count =
+            EffectiveMfgGeneratedCount(direct_reservation.index >= 0);
+        fg_generated_count = requested_generated_count;
+        g_mfg_active_generated_count = requested_generated_count;
+        g_mfg_active_frame_index = 1;
+
+        D3D12_RESOURCE_BARRIER fg_begin[4] = {};
+        UINT fg_begin_count = 0;
+        fg_begin[fg_begin_count++] = Transition(real_output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        for (unsigned int generated = 0; generated < requested_generated_count; ++generated)
+            fg_begin[fg_begin_count++] = Transition(fg_outputs[generated],
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        commands->ResourceBarrier(fg_begin_count, fg_begin);
+
+        const bool fg_reset = reset || g_fg_frames.load() == 0;
+        for (unsigned int generated = 0; generated < requested_generated_count; ++generated)
         {
-            AbortNeuralFrameCommands(slot_index);
-            Log("DLSS-G evaluation exception 0x%08X; frame generation disabled", exception);
-            g_framegen_failed = true;
-            return false;
+            g_mfg_active_frame_index = generated + 1;
+            SetFgEvaluationContract(real_output, fg_outputs[generated], depth, motion,
+                fg_reset && generated == 0);
+            exception = 0;
+            fg_result = SafeEvaluateFg(&exception);
+            if (exception)
+            {
+                AbortNeuralFrameCommands(slot_index);
+                Log("DLSS-G MFG evaluation exception 0x%08X at generated frame %u; frame generation disabled",
+                    exception, generated + 1);
+                g_framegen_failed = true;
+                return false;
+            }
+            if (NVSDK_NGX_FAILED(fg_result))
+            {
+                Log("DLSS-G MFG evaluation failed: 0x%08X (%s) at generated frame %u",
+                    static_cast<unsigned int>(fg_result), ResultName(fg_result), generated + 1);
+                g_framegen_failed = true;
+                return false;
+            }
+            ++evaluated_fg_frames;
         }
     }
     timestamp(4);
@@ -6846,8 +6919,9 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     {
         restore[restore_count++] = Transition(real_output,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        restore[restore_count++] = Transition(generated_output,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        for (unsigned int generated = 0; generated < evaluated_fg_frames; ++generated)
+            restore[restore_count++] = Transition(fg_outputs[generated],
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     }
     else
         restore[restore_count++] = Transition(real_output,
@@ -10463,7 +10537,7 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
 
 static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     ID3D12Resource *generated_source, ID3D12Resource *original_source,
-    bool has_generated_frame)
+    bool has_generated_frame, const PresentationFrameSlot *presentation_slot = nullptr)
 {
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || g_proxy_swapchain == nullptr) return false;
@@ -10482,11 +10556,21 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         g_reshade_overlay_open.load() &&
         g_post_reshade_color_ready.load(std::memory_order_acquire) && g_post_reshade_color;
     ID3D12Resource *post_source = composite_post ? g_post_reshade_color.Get() : original_source;
-    ID3D12Resource *present_sources[2] = {
-        use_framegen ? generated_source : real_source,
-        real_source
-    };
-    const UINT present_count = use_framegen ? 2u : 1u;
+    ID3D12Resource *present_sources[4] = {};
+    UINT generated_present_count = 0;
+    if (use_framegen)
+    {
+        generated_present_count = presentation_slot != nullptr ?
+            std::clamp(presentation_slot->mfg_generated_count, 1u, 3u) : 1u;
+        present_sources[0] = generated_source;
+        if (presentation_slot != nullptr && generated_present_count > 1)
+            for (UINT generated = 1; generated < generated_present_count; ++generated)
+                present_sources[generated] = presentation_slot->mfg_generated_outputs[generated - 1].Get();
+        present_sources[generated_present_count] = real_source;
+    }
+    else
+        present_sources[0] = real_source;
+    const UINT present_count = use_framegen ? generated_present_count + 1u : 1u;
     LARGE_INTEGER wait_begin = {}, wait_end = {};
     // Command allocators, lists and descriptors are independently ringed. Do
     // not wait for the previous compositor draw before recording the next one;
@@ -10494,6 +10578,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     g_cpu_proxy_fence_wait_us = 0;
     ConsumeProxyGpuTelemetry();
     const bool record_proxy_gpu = g_performance_telemetry_enabled &&
+        generated_present_count <= 1 &&
         !g_proxy_telemetry_pending && g_proxy_telemetry_query_heap && g_proxy_telemetry_readback;
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return false;
@@ -10784,7 +10869,7 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
             CounterDeltaMicroseconds(slot.submitted_qpc, present_begin));
     }
     const bool presented = PresentProxySourcesOnWorker(slot.real_output.Get(),
-        slot.generated_output.Get(), slot.original_input.Get(), slot.has_generated_frame);
+        slot.generated_output.Get(), slot.original_input.Get(), slot.has_generated_frame, &slot);
     slot.fence_value = g_proxy_fence_value;
     slot.state.store(PresentationSlotPresenting, std::memory_order_release);
     return presented;
@@ -12901,6 +12986,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         if (g_neural_ready) g_feature_recreate_requested = true;
         Log("experimental DLSS-G changed to %s", g_framegen_enabled ? "enabled" : "disabled");
     }
+    if (g_framegen_enabled)
+    {
+        int mfg_combo = static_cast<int>(std::clamp(g_mfg_multiplier, 2u, 4u)) - 2;
+        if (ImGui::Combo("MFG multiplier (restart required)", &mfg_combo, dlss5_aio_menu::kMfgItems, 3))
+        {
+            g_mfg_multiplier = static_cast<unsigned int>(mfg_combo + 2);
+            char mfg_value[8] = {};
+            sprintf_s(mfg_value, "%u", g_mfg_multiplier);
+            reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "MfgMultiplier", static_cast<const char *>(mfg_value));
+            Log("MFG multiplier changed to %ux; restart required", g_mfg_multiplier);
+        }
+        ImGui::TextDisabled(g_mfg_multiplier > 2 ?
+            "3x/4x MFG requires the Ada runtime unlock and direct presentation path." :
+            "2x uses the standard single generated frame path.");
+    }
     if (g_native_streamline_present_hook)
         ImGui::TextDisabled("Native Streamline is loaded. Addon FG is not blocked; disable the game's built-in Frame Generation.");
     else
@@ -13259,6 +13359,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_nr_third_pass_failed = false;
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
+        read_setting("MfgMultiplier", "2", value, sizeof(value)); g_mfg_multiplier = static_cast<unsigned int>(std::clamp(atoi(value), 2, 4));
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("AdaptivePressureGovernor", "1", value, sizeof(value)); g_adaptive_governor_enabled = strcmp(value, "0") != 0;
