@@ -77,7 +77,8 @@ jobs:
           $vulkanDst = Join-Path $pwd 'external\DLSS5-Feeder\external\vulkan'
           New-Item -ItemType Directory -Force $vulkanDst | Out-Null
           Copy-Item (Join-Path $vulkan 'include\vulkan') (Join-Path $vulkanDst 'vulkan') -Recurse -Force
-          Write-Host 'Prepared NVIDIA and Vulkan SDK headers.'
+          Copy-Item (Join-Path $vulkan 'include\vk_video') (Join-Path $vulkanDst 'vk_video') -Recurse -Force
+          Write-Host 'Prepared NVIDIA, Vulkan, and Vulkan-video SDK headers.'
 
       - name: Build x64 standalone addon
         shell: cmd
