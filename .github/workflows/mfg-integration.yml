@@ -20,7 +20,9 @@ jobs:
 
       - name: Apply MFG integration
         shell: pwsh
-        run: python tools/apply_mfg_aio_v5.py
+        run: |
+          python tools/apply_mfg_aio_v5.py
+          python tools/apply_mfg_aio_fixups.py
 
       - name: Static source checks
         shell: pwsh
@@ -38,6 +40,7 @@ jobs:
             'mfg_generated_outputs',
             'generated_present_count',
             'MfgMultiplier',
+            'D3D12_RESOURCE_BARRIER fg_begin[4] = {};',
           ]
           missing = [x for x in required if x not in s and x not in m]
           assert not missing, missing
