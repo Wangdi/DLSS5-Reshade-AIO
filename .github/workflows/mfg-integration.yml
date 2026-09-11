@@ -53,18 +53,21 @@ jobs:
         run: |
           $dst = Join-Path $pwd 'external\DLSS5-Feeder\external\ngx'
           New-Item -ItemType Directory -Force $dst | Out-Null
+          $ref = '374959484e79a640feaba44c93ac8cfb0a03f5b5'
           $headers = @(
             'nvsdk_ngx.h',
             'nvsdk_ngx_defs.h',
-            'nvsdk_ngx_defs_dlss.h',
             'nvsdk_ngx_defs_dlssd.h',
             'nvsdk_ngx_defs_dlssg.h',
-            'nvsdk_ngx_defs_dlssrr.h',
             'nvsdk_ngx_helpers.h',
-            'nvsdk_ngx_params.h'
+            'nvsdk_ngx_helpers_d3d.h',
+            'nvsdk_ngx_helpers_dlssg.h',
+            'nvsdk_ngx_helpers_dlssg_d3d.h',
+            'nvsdk_ngx_params.h',
+            'nvsdk_ngx_params_dlssg.h'
           )
           foreach ($h in $headers) {
-            Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/NVIDIA/DLSS/main/include/$h" -OutFile (Join-Path $dst $h)
+            Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/NVIDIA/DLSS/$ref/include/$h" -OutFile (Join-Path $dst $h)
           }
           Get-ChildItem $dst
 
