@@ -1,0 +1,70 @@
+name: Package Ada MFG x64 addon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [mfg-aio-3x4x]
+
+permissions:
+  contents: read
+
+jobs:
+  package-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply MFG integration
+        shell: pwsh
+        run: |
+          python tools/apply_mfg_aio_v5.py
+          python tools/apply_mfg_aio_fixups.py
+
+      - name: Prepare NVIDIA NGX SDK headers
+        shell: pwsh
+        run: |
+          $dst = Join-Path $pwd 'external\DLSS5-Feeder\external\ngx'
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          $ref = '374959484e79a640feaba44c93ac8cfb0a03f5b5'
+          $headers = @(
+            'nvsdk_ngx.h',
+            'nvsdk_ngx_defs.h',
+            'nvsdk_ngx_defs_dlssd.h',
+            'nvsdk_ngx_defs_dlssg.h',
+            'nvsdk_ngx_helpers.h',
+            'nvsdk_ngx_helpers_d3d.h',
+            'nvsdk_ngx_helpers_dlssg.h',
+            'nvsdk_ngx_helpers_dlssg_d3d.h',
+            'nvsdk_ngx_params.h',
+            'nvsdk_ngx_params_dlssg.h'
+          )
+          foreach ($h in $headers) {
+            Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/NVIDIA/DLSS/$ref/include/$h" -OutFile (Join-Path $dst $h)
+          }
+          $vulkan = Join-Path $env:RUNNER_TEMP 'Vulkan-Headers'
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git $vulkan
+          $vulkanDst = Join-Path $pwd 'external\DLSS5-Feeder\external\vulkan'
+          New-Item -ItemType Directory -Force $vulkanDst | Out-Null
+          Copy-Item (Join-Path $vulkan 'include\vulkan') (Join-Path $vulkanDst 'vulkan') -Recurse -Force
+          Copy-Item (Join-Path $vulkan 'include\vk_video') (Join-Path $vulkanDst 'vk_video') -Recurse -Force
+
+      - name: Build x64 addon
+        shell: cmd
+        run: addon\build.bat
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'addon\build\*' -DestinationPath 'DLSS5-AIO-Ada-MFG-x64.zip' -Force
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: DLSS5-AIO-Ada-MFG-x64
+          path: DLSS5-AIO-Ada-MFG-x64.zip
+          if-no-files-found: error
+          retention-days: 14
