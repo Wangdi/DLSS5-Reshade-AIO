@@ -48,6 +48,16 @@ jobs:
         shell: pwsh
         run: git diff --check
 
+      - name: Prepare NVIDIA NGX SDK headers for CI
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP 'dlss-sdk'
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git $sdk
+          $dst = Join-Path $pwd 'external\DLSS5-Feeder\external\ngx'
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Get-ChildItem (Join-Path $sdk 'include\nvsdk_ngx*.h') | Copy-Item -Destination $dst -Force
+          Get-ChildItem $dst
+
       - name: Build x64 standalone addon
         shell: cmd
         run: addon\build.bat
