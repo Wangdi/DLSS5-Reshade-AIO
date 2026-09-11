@@ -51,11 +51,21 @@ jobs:
       - name: Prepare NVIDIA NGX SDK headers for CI
         shell: pwsh
         run: |
-          $sdk = Join-Path $env:RUNNER_TEMP 'dlss-sdk'
-          git clone --depth 1 https://github.com/NVIDIA/DLSS.git $sdk
           $dst = Join-Path $pwd 'external\DLSS5-Feeder\external\ngx'
           New-Item -ItemType Directory -Force $dst | Out-Null
-          Get-ChildItem (Join-Path $sdk 'include\nvsdk_ngx*.h') | Copy-Item -Destination $dst -Force
+          $headers = @(
+            'nvsdk_ngx.h',
+            'nvsdk_ngx_defs.h',
+            'nvsdk_ngx_defs_dlss.h',
+            'nvsdk_ngx_defs_dlssd.h',
+            'nvsdk_ngx_defs_dlssg.h',
+            'nvsdk_ngx_defs_dlssrr.h',
+            'nvsdk_ngx_helpers.h',
+            'nvsdk_ngx_params.h'
+          )
+          foreach ($h in $headers) {
+            Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/NVIDIA/DLSS/main/include/$h" -OutFile (Join-Path $dst $h)
+          }
           Get-ChildItem $dst
 
       - name: Build x64 standalone addon
