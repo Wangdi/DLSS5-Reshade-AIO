@@ -1,0 +1,60 @@
+name: Apply and build Ada MFG integration
+
+on:
+  push:
+    branches: [mfg-aio-3x4x]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply MFG integration
+        shell: pwsh
+        run: python tools/apply_mfg_aio_v2.py
+
+      - name: Static source checks
+        shell: pwsh
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s = Path('addon/src/nr-standalone.cpp').read_text(encoding='utf-8')
+          m = Path('addon/include/aio-menu-schema.hpp').read_text(encoding='utf-8')
+          required = [
+            'dlss5_aio_mfg::Apply(g_dlssg_module',
+            'g_mfg_active_generated_count',
+            'g_mfg_active_frame_index',
+            'DLSSG.MultiFrameCount", g_mfg_active_generated_count',
+            'DLSSG.MultiFrameIndex", g_mfg_active_frame_index',
+            'mfg_generated_outputs',
+            'generated_present_count',
+            'MfgMultiplier',
+          ]
+          missing = [x for x in required if x not in s and x not in m]
+          assert not missing, missing
+          print('MFG source checks: PASS')
+          PY
+
+      - name: Build x64 standalone addon
+        shell: cmd
+        run: addon\build.bat
+
+      - name: Commit generated source changes
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git status --short
+          if (-not (git diff --quiet)) {
+            git add addon/src/nr-standalone.cpp addon/include/aio-menu-schema.hpp
+            git commit -m 'Add Ada RTX 40 DLSS-G multi-frame generation path'
+            git push origin HEAD:mfg-aio-3x4x
+          }
