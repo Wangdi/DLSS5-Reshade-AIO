@@ -20,7 +20,7 @@ jobs:
 
       - name: Apply MFG integration
         shell: pwsh
-        run: python tools/apply_mfg_aio_v4.py
+        run: python tools/apply_mfg_aio_v5.py
 
       - name: Static source checks
         shell: pwsh
