@@ -5,6 +5,9 @@
  *
  * Runtime-only patching of the mapped DLSS-G image. No NVIDIA binary is
  * modified or redistributed. Layout checks are intentionally fail-closed.
+ *
+ * Integration note: this helper is consumed by the AIO standalone Direct-NGX
+ * path; Streamline's sl.dlss_g frame-count hook is deliberately not used.
  */
 #include <windows.h>
 #include <cstdint>
